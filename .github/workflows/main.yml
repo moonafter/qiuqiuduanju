@@ -68,6 +68,48 @@ jobs:
           $gcc = Join-Path $bin 'x86_64-w64-mingw32-gcc.exe'
           if (Test-Path $gcc) { & $gcc --version | Select-Object -First 1 } else { Write-Warning "未找到 $gcc" }
 
+      # 上游 shinchiro/mpv-winbuild-cmake 会滚动删除旧 release，写死的日期迟早 404。
+      # 这里在构建前动态取「当前最新的 mpv-dev-x86_64 资产」的日期/git提交/SHA256，
+      # 再对仓库里 CMakeLists.txt 的三处硬编码做临时替换，避免过期。
+      - name: 解析最新 libmpv 资产
+        id: libmpv
+        shell: pwsh
+        run: |
+          $releases = Invoke-RestMethod -Uri 'https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases?per_page=1' -Headers @{ 'User-Agent' = 'actions' }
+          $tag = $releases[0].tag_name
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/shinchiro/mpv-winbuild-cmake/releases/tags/$tag" -Headers @{ 'User-Agent' = 'actions' }
+          $asset = $rel.assets | Where-Object {
+            $_.name -like 'mpv-dev-x86_64-*.7z' -and $_.name -notlike '*-v3-*'
+          } | Select-Object -First 1
+          if (-not $asset) { throw "未找到 mpv-dev-x86_64 资产（tag=$tag）" }
+          $name = $asset.name
+          $sha256 = $asset.digest -replace '^sha256:', ''
+          $commit = ($name -split '-git-')[1] -replace '\.7z$', ''
+          if (-not $sha256) { throw '资产缺少 digest，无法取得 SHA256' }
+          Write-Host "最新 libmpv：$name"
+          Write-Host "SHA256：$sha256"
+
+          $cmake = 'packages\media_kit_libs_windows_video\windows\CMakeLists.txt'
+          $text = Get-Content $cmake -Raw
+
+          # 顺序很重要：先把 SHA256 按「旧文件名行正下方」定位替换掉，
+          # 再替换文件名和 URL。这样能精确定位 libmpv，不误伤 ANGLE 的 SHA256。
+          # 1) SHA256 —— 匹配旧 mpv 文件名行紧邻下一行的 64 位 hex
+          $pattern = '(?s)(mpv-dev-x86_64-\d{8}-git-[0-9a-f]+\.7z"\s*\r?\n\s*")[0-9a-f]{64}(")'
+          $text = [regex]::Replace($text, $pattern, '${1}' + $sha256 + '${2}')
+          # 2) 文件名里的日期和 git 提交
+          $text = $text -replace 'mpv-dev-x86_64-\d{8}-git-[0-9a-f]+\.7z', $name
+          # 3) 下载 URL
+          $text = $text -replace 'https://github\.com/shinchiro/mpv-winbuild-cmake/releases/download/[^"]+', "https://github.com/shinchiro/mpv-winbuild-cmake/releases/download/$tag/$name"
+
+          if ($text -notmatch [regex]::Escape($name)) { throw 'CMakeLists.txt 文件名替换失败' }
+          if ($text -notmatch [regex]::Escape($sha256)) { throw 'CMakeLists.txt SHA256 替换失败' }
+
+          Set-Content -Path $cmake -Value $text -NoNewline
+          Write-Host 'CMakeLists.txt 已更新为最新 libmpv 资产'
+          "name=$name" >> $env:GITHUB_OUTPUT
+          "sha256=$sha256" >> $env:GITHUB_OUTPUT
+
       # 编译 Go 核心 → flutter build windows → 打 dist\windows\*.zip 并写 SHA256SUMS.txt
       - name: 构建 Windows ZIP
         run: python scripts/build_windows.py ${{ matrix.arguments }}
