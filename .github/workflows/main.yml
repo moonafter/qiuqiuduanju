@@ -110,9 +110,56 @@ jobs:
           "name=$name" >> $env:GITHUB_OUTPUT
           "sha256=$sha256" >> $env:GITHUB_OUTPUT
 
+      # 顶层 windows/CMakeLists.txt 的 install(DIRECTORY native_assets) 在目录不存在时会直接
+      # 报错导致 install 失败（MSB3073）。本项目没用到 native assets，目录不会被 Flutter 创建，
+      # 这里加 EXISTS 保护，避免 install 阶段 fatal。
+      - name: 修复 native_assets install 缺失
+        shell: pwsh
+        run: |
+          $cmake = 'windows\CMakeLists.txt'
+          $text = Get-Content $cmake -Raw
+
+          # 把 install(DIRECTORY "${NATIVE_ASSETS_DIR}" ...) 用 if(EXISTS) 包起来
+          $old = 'install(DIRECTORY "${NATIVE_ASSETS_DIR}"' + "`n" + '   DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"' + "`n" + '   COMPONENT Runtime)'
+          $new = 'if(EXISTS "${NATIVE_ASSETS_DIR}")' + "`n" + '  install(DIRECTORY "${NATIVE_ASSETS_DIR}"' + "`n" + '     DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"' + "`n" + '     COMPONENT Runtime)' + "`n" + 'endif()'
+          if ($text -notmatch [regex]::Escape($old)) {
+            throw '未匹配到 native_assets 的 install 块，无法打补丁'
+          }
+          $text = $text.Replace($old, $new)
+
+          # 同样给 flutter_assets 目录加保护（保险）
+          $old2 = 'install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"'
+          $new2 = 'if(EXISTS "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}")' + "`n" + '  install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"'
+          $text = $text.Replace($old2, $new2)
+
+          Set-Content -Path $cmake -Value $text -NoNewline
+          Write-Host '已给 native_assets / flutter_assets 的 install 加 EXISTS 保护'
+
       # 编译 Go 核心 → flutter build windows → 打 dist\windows\*.zip 并写 SHA256SUMS.txt
       - name: 构建 Windows ZIP
         run: python scripts/build_windows.py ${{ matrix.arguments }}
+
+      # 若上一步失败，直接手动跑 CMake install，拿到被 Flutter 吞掉的真实错误行
+      - name: 诊断 install 失败原因（仅失败时）
+        if: failure()
+        shell: pwsh
+        run: |
+          Write-Host '=== 手动执行 cmake install 以暴露真实错误 ==='
+          $cmake = Get-ChildItem 'C:\Program Files\Microsoft Visual Studio\*\*\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe' -ErrorAction SilentlyContinue |
+                   Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cmake) {
+            $cmake = (Get-Command cmake.exe -ErrorAction SilentlyContinue).Source
+          }
+          Write-Host "cmake = $cmake"
+          if ($cmake -and (Test-Path 'build\windows\x64\cmake_install.cmake')) {
+            Push-Location 'build\windows\x64'
+            & $cmake -DCMAKE_INSTALL_CONFIG_NAME=Release -P cmake_install.cmake
+            Write-Host "cmake install 退出码：$LASTEXITCODE"
+            Pop-Location
+          } else {
+            Write-Host '找不到 cmake_install.cmake，列出 build 目录：'
+            Get-ChildItem 'build\windows\x64' -ErrorAction SilentlyContinue | Select-Object Name
+          }
 
       # mingw 是 posix 线程模型，cgo 编出的 DLL 会动态依赖 libwinpthread-1.dll；
       # 该文件不在 Flutter 的 Release 目录里，运行时缺它会直接加载失败，这里补齐后重打 ZIP。
