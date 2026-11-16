@@ -1,0 +1,127 @@
+name: Build Windows package
+
+# 云端生成 Windows 10/11 x64 便携包（ZIP），本机不用装 Flutter / Go / MinGW / VS。
+# 用法：Actions 页面左侧选本工作流 → Run workflow → 跑完在运行页底部下载 Artifact。
+# 产出：hongguojian-<版本>-windows-x64.zip / zhenguojian-<版本>-windows-x64.zip + SHA256SUMS.txt
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '同时上传到 GitHub Release（不勾选则只保留 Actions Artifact）'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GOPROXY: https://proxy.golang.org,direct
+  GOSUMDB: sum.golang.org
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: hongguojian
+            arguments: ''
+          - edition: zhenguojian
+            arguments: '--all-sources'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: native/go.mod
+          cache-dependency-path: native/go.sum
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.47.4'
+          channel: stable
+          cache: true
+
+      # Go 的 c-shared DLL 需要 x64 MinGW 编译器
+      - uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      # 编译 Go 核心 → flutter build windows → 打 dist\windows\*.zip 并写 SHA256SUMS.txt
+      - name: 构建 Windows ZIP
+        run: python scripts/build_windows.py ${{ matrix.arguments }}
+
+      - name: 确认产物
+        shell: pwsh
+        run: |
+          Get-ChildItem dist\windows | Format-Table Name, Length
+          if (-not (Get-ChildItem dist\windows -Filter '*.zip')) { throw '没有生成 ZIP' }
+          Get-Content dist\windows\SHA256SUMS.txt
+
+      # 解压 ZIP 后真实启动一次应用；失败只记日志，不影响已生成的包
+      - name: 冒烟检查（非阻断）
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          choco install ffmpeg --no-progress -y
+          $env:PATH = 'C:\ProgramData\chocolatey\bin;' + $env:PATH
+          python scripts/smoke_windows.py ${{ matrix.arguments }}
+
+      - uses: actions/upload-artifact@v4
+        if: always() && hashFiles('dist/windows/*') != ''
+        with:
+          name: ${{ matrix.edition }}-windows
+          path: dist/windows/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    needs: windows
+    if: inputs.publish_release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-windows'
+          path: assets
+
+      - name: 汇总产物
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          for dir in assets/*/; do
+            edition="$(basename "$dir")"
+            edition="${edition%-windows}"
+            for file in "$dir"*; do
+              name="$(basename "$file")"
+              if [ "$name" = "SHA256SUMS.txt" ]; then
+                cp "$file" "out/SHA256SUMS-$edition.txt"
+              else
+                cp "$file" out/
+              fi
+            done
+          done
+          ls -lh out
+
+      - name: 创建 Release 并上传
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="windows-${GITHUB_RUN_NUMBER}"
+          gh release create "$tag" --title "秋秋短剧 Windows 便携包 $tag" \
+            --notes "由 GitHub Actions 运行 [$GITHUB_RUN_NUMBER]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID) 生成。解压后运行 hongguojian.exe / zhenguojian.exe，保持所有 DLL 和 data 目录在同一层。" \
+            out/*
