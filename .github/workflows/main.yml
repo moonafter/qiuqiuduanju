@@ -53,14 +53,60 @@ jobs:
           channel: stable
           cache: true
 
-      # Go 的 c-shared DLL 需要 x64 MinGW 编译器
-      - uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+      # Go 的 c-shared DLL 需要 x64 MinGW 编译器。
+      # 不用 egor-tensin/setup-mingw@v2：它会在收尾时删除 libpthread.dll.a，
+      # 而 mingw 16.2.0 起不再提供该文件，导致整步退出 1。
+      - name: 安装 MinGW-w64
+        shell: pwsh
+        run: |
+          choco install mingw --no-progress -y
+          $bin = Get-ChildItem 'C:\ProgramData\mingw64\*\bin' -Directory -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          if (-not $bin) { throw '未找到 MinGW 的 bin 目录' }
+          $bin >> $env:GITHUB_PATH
+          Write-Host "MinGW bin: $bin"
+          $gcc = Join-Path $bin 'x86_64-w64-mingw32-gcc.exe'
+          if (Test-Path $gcc) { & $gcc --version | Select-Object -First 1 } else { Write-Warning "未找到 $gcc" }
 
       # 编译 Go 核心 → flutter build windows → 打 dist\windows\*.zip 并写 SHA256SUMS.txt
       - name: 构建 Windows ZIP
         run: python scripts/build_windows.py ${{ matrix.arguments }}
+
+      # mingw 是 posix 线程模型，cgo 编出的 DLL 会动态依赖 libwinpthread-1.dll；
+      # 该文件不在 Flutter 的 Release 目录里，运行时缺它会直接加载失败，这里补齐后重打 ZIP。
+      - name: 补齐 MinGW 运行时 DLL
+        shell: pwsh
+        run: |
+          $release = (Resolve-Path 'build\windows\x64\runner\Release').Path
+          $core = Join-Path $release 'duanju_core.dll'
+          $objdump = Get-Command 'x86_64-w64-mingw32-objdump.exe' -ErrorAction SilentlyContinue
+          if (-not $objdump) { throw '未找到 objdump，无法检查 DLL 依赖' }
+
+          $imports = & $objdump.Source -p $core |
+                     Select-String 'DLL Name:\s*(\S+)' |
+                     ForEach-Object { $_.Matches[0].Groups[1].Value } |
+                     Sort-Object -Unique
+          Write-Host "duanju_core.dll 依赖：$($imports -join ', ')"
+
+          $copied = @()
+          foreach ($dll in $imports) {
+            if (Test-Path (Join-Path $release $dll)) { continue }
+            $source = Get-ChildItem 'C:\ProgramData\mingw64\*\bin' -Filter $dll -ErrorAction SilentlyContinue |
+                      Select-Object -First 1
+            if ($source) {
+              Copy-Item $source.FullName $release
+              $copied += $dll
+              Write-Host "已补齐 $dll"
+            } else {
+              Write-Warning "$dll 既不在 Release 目录也不在 MinGW 目录，运行可能失败"
+            }
+          }
+
+          if ($copied) {
+            python scripts/package_release.py --platform windows ${{ matrix.arguments }}
+          } else {
+            Write-Host '无需补齐，ZIP 保持原样'
+          }
 
       - name: 确认产物
         shell: pwsh
